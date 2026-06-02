@@ -324,7 +324,7 @@ async def chat_pdf(data: dict):
                 "Sos un tutor copado que ayuda a estudiantes adolescentes. "
                 "Tenés acceso al contenido de un documento de estudio. "
                 "Respondé siempre de forma clara, amigable y con ejemplos del día a día. "
-                "Si la pregunta no tiene que ver con el documento, decilo amablemente y redirigí. "
+                "Si la pregunta no tiene que ver con el documento, responde ÚNICAMENTE: 'Esa pregunta no está relacionada con el documento. ¿Tenés alguna duda sobre el tema de estudio?' y no agregues nada más. "
                 "Hablá en español, informal pero respetuoso. Sé conciso.\n\n"
                 f"CONTENIDO DEL DOCUMENTO:\n{contexto[:6000]}"
             ),
@@ -332,8 +332,11 @@ async def chat_pdf(data: dict):
     ]
 
     # Agregar historial previo de la conversación
-    for msg in historial[-6:]:  # últimos 6 mensajes para no pasarse de tokens
-        mensajes.append({"role": msg["role"], "content": msg["content"]})
+    for msg in historial[-6:]: # últimos 6 mensajes para no pasarse de tokens
+        role = msg.get("role") or msg.get("rol")
+        content = msg.get("content") or msg.get("contenido") or msg.get("texto", "")
+        if role in ("user", "assistant") and content:
+            mensajes.append({"role": role, "content": content})
 
     mensajes.append({"role": "user", "content": pregunta})
 
