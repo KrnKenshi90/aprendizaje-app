@@ -1,11 +1,16 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
 from groq import Groq
 from dotenv import load_dotenv
 from database import guardar_registro, obtener_registros, get_connection
-import os, json, re
+import os, json, re, logging
 import bcrypt
 import hashlib
+import mysql.connector
+import requests as http_requests
+
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(levelname)s %(message)s")
 
 load_dotenv()
 app = FastAPI()
@@ -20,6 +25,111 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Modelos de entrada ─────────────────────────────────────
+
+class RegistroUsuarioIn(BaseModel):
+    nombre: str
+    email: str
+    password: str
+
+    @field_validator("nombre", "email", "password")
+    @classmethod
+    def no_vacio(cls, v):
+        if not v or not v.strip():
+            raise ValueError("El campo no puede estar vacío")
+        return v.strip()
+
+    @field_validator("password")
+    @classmethod
+    def min_length(cls, v):
+        if len(v) < 6:
+            raise ValueError("La contraseña debe tener al menos 6 caracteres")
+        return v
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class GoogleTokenIn(BaseModel):
+    token: str
+
+
+class ClasificarIn(BaseModel):
+    texto: str
+    tema: str = ""
+    usuario_id: int
+
+    @field_validator("texto")
+    @classmethod
+    def texto_no_vacio(cls, v):
+        if not v or not v.strip():
+            raise ValueError("El texto no puede estar vacío")
+        return v.strip()
+
+
+class ChatPDFIn(BaseModel):
+    pregunta: str
+    contexto: str
+    historial: list = []
+
+
+class QuizPDFIn(BaseModel):
+    contexto: str
+
+
+class QuizGenerarIn(BaseModel):
+    usuario_id: int
+    cantidad: int = 10
+
+
+class QuizGuardarIn(BaseModel):
+    usuario_id: int
+    puntaje: int
+    total: int
+
+    @field_validator("total")
+    @classmethod
+    def total_positivo(cls, v):
+        if v <= 0:
+            raise ValueError("El campo total debe ser un número positivo")
+        return v
+
+
+class MetasActualizarIn(BaseModel):
+    usuario_id: int
+    tecnico: int = 5
+    conceptual: int = 5
+    aplicado: int = 5
+    soft_skills: int = 5
+    contexto: int = 5
+
+
+class BadgeOtorgarIn(BaseModel):
+    usuario_id: int
+    tipo: str
+    nombre: str
+    descripcion: str = ""
+
+
+class NivelResumenIn(BaseModel):
+    tema: str
+    descripcion: str = ""
+
+    @field_validator("tema")
+    @classmethod
+    def tema_no_vacio(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Falta el tema")
+        return v.strip()
+
+
+class NivelChatIn(BaseModel):
+    tema: str
+    historial: list
 
 
 # ── Contraseñas ────────────────────────────────────────────
@@ -52,76 +162,62 @@ def root():
 
 # ── Auth ───────────────────────────────────────────────────
 @app.post("/registro")
-def registro(data: dict):
-    nombre   = (data.get("nombre") or "").strip()
-    email    = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-
-    if not nombre or not email or not password:
-        raise HTTPException(status_code=422, detail="Faltan campos requeridos")
-    if len(password) < 6:
-        raise HTTPException(status_code=422, detail="La contraseña debe tener al menos 6 caracteres")
-
-    hashed = hash_password(password)
+def registro(data: RegistroUsuarioIn):
+    hashed = hash_password(data.password)
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             "INSERT INTO usuarios (nombre, email, password) VALUES (%s, %s, %s)",
-            (nombre, email, hashed),
+            (data.nombre, data.email.lower(), hashed),
         )
         conn.commit()
         return {"mensaje": "Usuario registrado correctamente"}
-    except Exception:
+    except mysql.connector.errors.IntegrityError:
         raise HTTPException(status_code=400, detail="El email ya está registrado")
+    except Exception as e:
+        logging.error("Error en /registro: %s", e)
+        raise HTTPException(status_code=500, detail="Error interno al registrar usuario")
     finally:
         cursor.close()
         conn.close()
 
 
 @app.post("/login")
-def login(data: dict):
-    email    = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-
+def login(data: LoginIn):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
         "SELECT id, nombre, password FROM usuarios WHERE email = %s",
-        (email,),
+        (data.email.strip().lower(),),
     )
     usuario = cursor.fetchone()
     cursor.close()
     conn.close()
 
-    if not usuario or not verify_password(password, usuario["password"]):
+    if not usuario or not verify_password(data.password, usuario["password"]):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
-    _migrar_hash(usuario["id"], password, usuario["password"])
+    _migrar_hash(usuario["id"], data.password, usuario["password"])
     return {"id": usuario["id"], "nombre": usuario["nombre"]}
 
 
 # ── Google OAuth ────────────────────────────────────────────
-import requests as http_requests
-
 @app.post("/auth/google")
-def auth_google(data: dict):
-    """Recibe el token de Google del frontend y verifica con Google."""
-    token = data.get("token") or ""
-    if not token:
-        raise HTTPException(status_code=422, detail="Token de Google requerido")
-
-    # Verificar el token con la API de Google
+def auth_google(data: GoogleTokenIn):
     try:
         resp = http_requests.get(
             "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {data.token}"},
             timeout=8,
         )
         if resp.status_code != 200:
             raise HTTPException(status_code=401, detail="Token de Google inválido")
         info = resp.json()
-    except Exception:
+    except HTTPException:
+        raise
+    except http_requests.RequestException as e:
+        logging.error("Error verificando token de Google: %s", e)
         raise HTTPException(status_code=401, detail="No se pudo verificar el token de Google")
 
     google_id = info.get("sub")
@@ -133,8 +229,6 @@ def auth_google(data: dict):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-
-    # Buscar usuario por google_id o por email
     cursor.execute(
         "SELECT id, nombre FROM usuarios WHERE google_id = %s OR email = %s LIMIT 1",
         (google_id, email),
@@ -142,7 +236,6 @@ def auth_google(data: dict):
     usuario = cursor.fetchone()
 
     if usuario:
-        # Si existe pero no tiene google_id guardado, actualizarlo
         cursor.execute(
             "UPDATE usuarios SET google_id = %s WHERE id = %s AND google_id IS NULL",
             (google_id, usuario["id"]),
@@ -152,7 +245,6 @@ def auth_google(data: dict):
         conn.close()
         return {"id": usuario["id"], "nombre": usuario["nombre"]}
     else:
-        # Crear nuevo usuario con Google
         cursor.execute(
             "INSERT INTO usuarios (nombre, email, password, google_id) VALUES (%s, %s, %s, %s)",
             (nombre, email, "", google_id),
@@ -179,13 +271,8 @@ def _extraer_json(texto: str) -> dict:
 NUTRIENTES_VALIDOS = {"TECNICO", "CONCEPTUAL", "APLICADO", "SOFT_SKILLS", "CONTEXTO"}
 
 @app.post("/clasificar")
-async def clasificar(data: dict):
-    texto      = (data.get("texto") or "").strip()
-    usuario_id = data.get("usuario_id")
-    tema       = (data.get("tema") or "").strip() or None
-
-    if not texto:
-        raise HTTPException(status_code=422, detail="El texto no puede estar vacío")
+async def clasificar(data: ClasificarIn):
+    tema = data.tema.strip() or None
 
     respuesta = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -200,7 +287,7 @@ async def clasificar(data: dict):
                     "Nutrientes posibles: TECNICO, CONCEPTUAL, APLICADO, SOFT_SKILLS, CONTEXTO"
                 ),
             },
-            {"role": "user", "content": texto},
+            {"role": "user", "content": data.texto},
         ],
         temperature=0.1,
     )
@@ -208,28 +295,43 @@ async def clasificar(data: dict):
     raw = respuesta.choices[0].message.content
     try:
         resultado = _extraer_json(raw)
-    except Exception:
-        raise HTTPException(status_code=502, detail="La IA devolvio una respuesta inesperada")
+    except (ValueError, json.JSONDecodeError):
+        logging.error("IA devolvió JSON inválido en /clasificar: %s", raw[:200])
+        raise HTTPException(status_code=502, detail="La IA devolvió una respuesta inesperada")
 
     nutrientes = [n for n in resultado.get("nutrientes", []) if n in NUTRIENTES_VALIDOS]
     if not nutrientes:
         nutrientes = ["CONCEPTUAL"]
 
     resumen = resultado.get("resumen", "Sin resumen")
-    guardar_registro(texto, resumen, nutrientes, usuario_id, tema)
+    guardar_registro(data.texto, resumen, nutrientes, data.usuario_id, tema)
     return {"nutrientes": nutrientes, "resumen": resumen}
 
 
 # ── Registros ──────────────────────────────────────────────
 @app.get("/registros/{usuario_id}")
-def get_registros(usuario_id: int):
-    return obtener_registros(usuario_id)
+def get_registros(
+    usuario_id: int,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return obtener_registros(usuario_id, limit=limit, offset=offset)
 
 
 @app.delete("/registros/{registro_id}")
-def eliminar_registro(registro_id: int):
+def eliminar_registro(registro_id: int, usuario_id: int):
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute("SELECT usuario_id FROM registros WHERE id = %s", (registro_id,))
+    row = cursor.fetchone()
+    if not row:
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Registro no encontrado")
+    if row[0] != usuario_id:
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="No tienes permiso para eliminar este registro")
     cursor.execute("DELETE FROM registros WHERE id = %s", (registro_id,))
     conn.commit()
     cursor.close()
@@ -240,30 +342,24 @@ def eliminar_registro(registro_id: int):
 # ── PDF: Subir y analizar ───────────────────────────────────
 @app.post("/pdf/analizar")
 async def analizar_pdf(file: UploadFile = File(...)):
-    """Recibe un PDF, extrae el texto y devuelve resumen + puntos clave."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Solo se aceptan archivos PDF")
 
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except ImportError:
         raise HTTPException(status_code=500, detail="PyMuPDF no instalado. Ejecuta: pip install pymupdf")
 
     contenido = await file.read()
     try:
         doc = fitz.open(stream=contenido, filetype="pdf")
-        texto_pdf = ""
-        for pagina in doc:
-            texto_pdf += pagina.get_text()
+        texto_pdf = "".join(pagina.get_text() for pagina in doc)
         doc.close()
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"No se pudo leer el PDF: {str(e)}")
 
     if not texto_pdf.strip():
         raise HTTPException(status_code=422, detail="El PDF no tiene texto legible (puede ser una imagen escaneada)")
-
-    # Limitar texto para no exceder tokens del modelo
-    texto_recortado = texto_pdf[:8000]
 
     respuesta = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -281,10 +377,7 @@ async def analizar_pdf(file: UploadFile = File(...)):
                     '"titulo": "titulo corto del documento"}'
                 ),
             },
-            {
-                "role": "user",
-                "content": f"Analizá este texto de estudio y explicámelo:\n\n{texto_recortado}"
-            },
+            {"role": "user", "content": f"Analizá este texto de estudio y explicámelo:\n\n{texto_pdf[:8000]}"},
         ],
         temperature=0.3,
     )
@@ -292,7 +385,8 @@ async def analizar_pdf(file: UploadFile = File(...)):
     raw = respuesta.choices[0].message.content
     try:
         resultado = _extraer_json(raw)
-    except Exception:
+    except (ValueError, json.JSONDecodeError):
+        logging.error("IA devolvió JSON inválido en /pdf/analizar: %s", raw[:200])
         raise HTTPException(status_code=502, detail="La IA no pudo analizar el PDF")
 
     return {
@@ -300,21 +394,16 @@ async def analizar_pdf(file: UploadFile = File(...)):
         "resumen": resultado.get("resumen", ""),
         "puntos_clave": resultado.get("puntos_clave", []),
         "consejo": resultado.get("consejo", ""),
-        "texto_completo": texto_pdf[:12000],  # guardamos para el chat
+        "texto_completo": texto_pdf[:12000],
     }
 
 
 # ── PDF: Chat ───────────────────────────────────────────────
 @app.post("/pdf/chat")
-async def chat_pdf(data: dict):
-    """Responde preguntas sobre el contenido del PDF cargado."""
-    pregunta   = (data.get("pregunta") or "").strip()
-    contexto   = (data.get("contexto") or "").strip()
-    historial  = data.get("historial") or []
-
-    if not pregunta:
+async def chat_pdf(data: ChatPDFIn):
+    if not data.pregunta.strip():
         raise HTTPException(status_code=422, detail="La pregunta no puede estar vacía")
-    if not contexto:
+    if not data.contexto.strip():
         raise HTTPException(status_code=422, detail="No hay PDF cargado")
 
     mensajes = [
@@ -324,38 +413,34 @@ async def chat_pdf(data: dict):
                 "Sos un tutor copado que ayuda a estudiantes adolescentes. "
                 "Tenés acceso al contenido de un documento de estudio. "
                 "Respondé siempre de forma clara, amigable y con ejemplos del día a día. "
-                "Si la pregunta no tiene que ver con el documento, responde ÚNICAMENTE: 'Esa pregunta no está relacionada con el documento. ¿Tenés alguna duda sobre el tema de estudio?' y no agregues nada más. "
+                "Si la pregunta no tiene que ver con el documento, responde ÚNICAMENTE: "
+                "'Esa pregunta no está relacionada con el documento. ¿Tenés alguna duda sobre el tema de estudio?' "
                 "Hablá en español, informal pero respetuoso. Sé conciso.\n\n"
-                f"CONTENIDO DEL DOCUMENTO:\n{contexto[:6000]}"
+                f"CONTENIDO DEL DOCUMENTO:\n{data.contexto[:6000]}"
             ),
         }
     ]
 
-    # Agregar historial previo de la conversación
-    for msg in historial[-6:]: # últimos 6 mensajes para no pasarse de tokens
+    for msg in data.historial[-6:]:
         role = msg.get("role") or msg.get("rol")
         content = msg.get("content") or msg.get("contenido") or msg.get("texto", "")
         if role in ("user", "assistant") and content:
             mensajes.append({"role": role, "content": content})
 
-    mensajes.append({"role": "user", "content": pregunta})
+    mensajes.append({"role": "user", "content": data.pregunta})
 
     respuesta = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=mensajes,
         temperature=0.5,
     )
-
     return {"respuesta": respuesta.choices[0].message.content}
 
 
 # ── PDF: Quiz ───────────────────────────────────────────────
 @app.post("/pdf/quiz")
-async def generar_quiz(data: dict):
-    """Genera preguntas de práctica basadas en el PDF."""
-    contexto = (data.get("contexto") or "").strip()
-
-    if not contexto:
+async def generar_quiz(data: QuizPDFIn):
+    if not data.contexto.strip():
         raise HTTPException(status_code=422, detail="No hay PDF cargado")
 
     respuesta = client.chat.completions.create(
@@ -373,10 +458,7 @@ async def generar_quiz(data: dict):
                     "\nGenera exactamente 5 preguntas variadas del tema."
                 ),
             },
-            {
-                "role": "user",
-                "content": f"Generá 5 preguntas de práctica sobre este texto:\n\n{contexto[:6000]}"
-            },
+            {"role": "user", "content": f"Generá 5 preguntas de práctica sobre este texto:\n\n{data.contexto[:6000]}"},
         ],
         temperature=0.4,
     )
@@ -384,22 +466,22 @@ async def generar_quiz(data: dict):
     raw = respuesta.choices[0].message.content
     try:
         resultado = _extraer_json(raw)
-    except Exception:
+    except (ValueError, json.JSONDecodeError):
+        logging.error("IA devolvió JSON inválido en /pdf/quiz: %s", raw[:200])
         raise HTTPException(status_code=502, detail="La IA no pudo generar el quiz")
 
     return resultado
 
-@app.post("/quiz/generar")
-async def generar_quiz_historial(data: dict):
-    usuario_id = data.get("usuario_id")
-    cantidad = data.get("cantidad", 10)
 
+# ── Quiz historial ─────────────────────────────────────────
+@app.post("/quiz/generar")
+async def generar_quiz_historial(data: QuizGenerarIn):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT texto, resumen, nutrientes FROM registros 
+        SELECT texto, resumen, nutrientes FROM registros
         WHERE usuario_id = %s ORDER BY fecha DESC LIMIT 20
-    """, (usuario_id,))
+    """, (data.usuario_id,))
     registros = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -419,7 +501,7 @@ async def generar_quiz_historial(data: dict):
                 "role": "system",
                 "content": (
                     f"Eres un evaluador educativo experto que crea exámenes de alta calidad.\n"
-                    f"Genera exactamente {cantidad} preguntas mezclando DOS tipos:\n"
+                    f"Genera exactamente {data.cantidad} preguntas mezclando DOS tipos:\n"
                     "- 'opcion_multiple': 4 opciones, una correcta, con explicación detallada\n"
                     "- 'completar': frase con ___, 4 opciones de respuesta, una correcta\n\n"
                     "Las preguntas deben ser desafiantes, precisas y educativas.\n"
@@ -430,10 +512,7 @@ async def generar_quiz_historial(data: dict):
                     ']}'
                 )
             },
-            {
-                "role": "user",
-                "content": f"{prompt_contexto}\n\nGenera exactamente {cantidad} preguntas variadas ({nivel}). Mezcla opcion multiple y completar. Asegurate que sean desafiantes y educativas."
-            }
+            {"role": "user", "content": f"{prompt_contexto}\n\nGenera exactamente {data.cantidad} preguntas variadas ({nivel})."}
         ],
         temperature=0.6,
     )
@@ -441,31 +520,22 @@ async def generar_quiz_historial(data: dict):
     raw = respuesta.choices[0].message.content
     try:
         resultado = _extraer_json(raw)
-    except Exception:
+    except (ValueError, json.JSONDecodeError):
+        logging.error("IA devolvió JSON inválido en /quiz/generar: %s", raw[:200])
         raise HTTPException(status_code=502, detail="Error generando el quiz")
 
     return resultado
 
 
 @app.post("/quiz/guardar")
-async def guardar_resultado_quiz(data: dict):
-    usuario_id = data.get("usuario_id")
-    puntaje = data.get("puntaje")
-    total = data.get("total")
-
-    if usuario_id is None or puntaje is None or total is None:
-        raise HTTPException(status_code=422, detail="Faltan campos requeridos: usuario_id, puntaje, total")
-    if not isinstance(total, (int, float)) or total <= 0:
-        raise HTTPException(status_code=422, detail="El campo total debe ser un número positivo")
-
-    porcentaje = round((puntaje / total) * 100)
-
+async def guardar_resultado_quiz(data: QuizGuardarIn):
+    porcentaje = round((data.puntaje / data.total) * 100)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO quiz_resultados (usuario_id, puntaje, total, porcentaje, fecha)
         VALUES (%s, %s, %s, %s, CURDATE())
-    """, (usuario_id, puntaje, total, porcentaje))
+    """, (data.usuario_id, data.puntaje, data.total, porcentaje))
     conn.commit()
     cursor.close()
     conn.close()
@@ -477,10 +547,10 @@ async def historial_quiz(usuario_id: int):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT puntaje, total, porcentaje, 
+        SELECT puntaje, total, porcentaje,
                DATE_FORMAT(fecha, '%Y-%m-%d') as fecha
-        FROM quiz_resultados 
-        WHERE usuario_id = %s 
+        FROM quiz_resultados
+        WHERE usuario_id = %s
         ORDER BY fecha DESC, id DESC
         LIMIT 30
     """, (usuario_id,))
@@ -494,58 +564,48 @@ async def historial_quiz(usuario_id: int):
 from datetime import datetime, timedelta
 
 def obtener_lunes_actual():
-    """Retorna la fecha del lunes de esta semana"""
     hoy = datetime.now().date()
     return hoy - timedelta(days=hoy.weekday())
 
 @app.get("/metas/semana/{usuario_id}")
 def obtener_metas_semana(usuario_id: int):
-    """Obtiene las metas de esta semana y el progreso actual"""
     lunes = obtener_lunes_actual()
-    
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    
-    # Obtener metas de esta semana
+
     cursor.execute("""
-        SELECT tecnico, conceptual, aplicado, soft_skills, contexto 
-        FROM metas_semanales 
+        SELECT tecnico, conceptual, aplicado, soft_skills, contexto
+        FROM metas_semanales
         WHERE usuario_id = %s AND semana_inicio = %s
     """, (usuario_id, lunes))
     metas_row = cursor.fetchone()
-    
-    # Si no existen, crear con defaults
+
     if not metas_row:
         cursor.execute("""
-            INSERT INTO metas_semanales 
+            INSERT INTO metas_semanales
             (usuario_id, semana_inicio, tecnico, conceptual, aplicado, soft_skills, contexto)
             VALUES (%s, %s, 5, 5, 5, 5, 5)
         """, (usuario_id, lunes))
         conn.commit()
-        metas_row = {
-            "tecnico": 5, "conceptual": 5, "aplicado": 5, 
-            "soft_skills": 5, "contexto": 5
-        }
-    
-    # Obtener progreso de registros esta semana
+        metas_row = {"tecnico": 5, "conceptual": 5, "aplicado": 5, "soft_skills": 5, "contexto": 5}
+
     cursor.execute("""
-        SELECT nutrientes FROM registros 
+        SELECT nutrientes FROM registros
         WHERE usuario_id = %s AND fecha >= %s AND fecha < DATE_ADD(%s, INTERVAL 7 DAY)
     """, (usuario_id, lunes, lunes))
     registros = cursor.fetchall()
-    
+
     progreso = {"TECNICO": 0, "CONCEPTUAL": 0, "APLICADO": 0, "SOFT_SKILLS": 0, "CONTEXTO": 0}
     for reg in registros:
         if reg["nutrientes"]:
-            nutrientes = reg["nutrientes"].split(",")
-            for n in nutrientes:
+            for n in reg["nutrientes"].split(","):
                 n = n.strip()
                 if n in progreso:
                     progreso[n] += 1
-    
+
     cursor.close()
     conn.close()
-    
+
     return {
         "semana_inicio": str(lunes),
         "semana_fin": str(lunes + timedelta(days=6)),
@@ -558,108 +618,80 @@ def obtener_metas_semana(usuario_id: int):
     }
 
 @app.post("/metas/semana/actualizar")
-def actualizar_metas_semana(data: dict):
-    """Actualiza las metas de esta semana"""
-    usuario_id = data.get("usuario_id")
+def actualizar_metas_semana(data: MetasActualizarIn):
     lunes = obtener_lunes_actual()
-    
     conn = get_connection()
     cursor = conn.cursor()
-    
     cursor.execute("""
-        UPDATE metas_semanales SET 
-        tecnico = %s, conceptual = %s, aplicado = %s, 
+        UPDATE metas_semanales SET
+        tecnico = %s, conceptual = %s, aplicado = %s,
         soft_skills = %s, contexto = %s
         WHERE usuario_id = %s AND semana_inicio = %s
-    """, (
-        data.get("tecnico", 5),
-        data.get("conceptual", 5),
-        data.get("aplicado", 5),
-        data.get("soft_skills", 5),
-        data.get("contexto", 5),
-        usuario_id,
-        lunes
-    ))
+    """, (data.tecnico, data.conceptual, data.aplicado, data.soft_skills, data.contexto, data.usuario_id, lunes))
     conn.commit()
     cursor.close()
     conn.close()
-    
     return {"mensaje": "Metas actualizadas"}
 
 @app.get("/metas/historial/{usuario_id}")
 def historial_metas(usuario_id: int):
-    """Retorna historial de metas de las últimas 8 semanas"""
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    
     cursor.execute("""
-        SELECT semana_inicio, tecnico, conceptual, aplicado, soft_skills, 
+        SELECT semana_inicio, tecnico, conceptual, aplicado, soft_skills,
                contexto, completada
-        FROM metas_semanales 
-        WHERE usuario_id = %s 
+        FROM metas_semanales
+        WHERE usuario_id = %s
         ORDER BY semana_inicio DESC LIMIT 8
     """, (usuario_id,))
     metas = cursor.fetchall()
     cursor.close()
     conn.close()
-    
     return metas
 
 @app.get("/badges/{usuario_id}")
 def obtener_badges(usuario_id: int):
-    """Obtiene los badges del usuario"""
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    
     cursor.execute("""
-        SELECT tipo, nombre, descripcion, fecha_obtenido 
-        FROM badges 
-        WHERE usuario_id = %s 
+        SELECT tipo, nombre, descripcion, fecha_obtenido
+        FROM badges
+        WHERE usuario_id = %s
         ORDER BY fecha_obtenido DESC
     """, (usuario_id,))
     badges = cursor.fetchall()
     cursor.close()
     conn.close()
-    
     return badges
 
 @app.post("/badges/otorgar")
-def otorgar_badge(data: dict):
-    """Otorga un badge al usuario (uso interno)"""
-    usuario_id = data.get("usuario_id")
-    tipo = data.get("tipo")  # "consistencia", "primeros_pasos", etc
-    nombre = data.get("nombre")
-    descripcion = data.get("descripcion", "")
-    
+def otorgar_badge(data: BadgeOtorgarIn):
     conn = get_connection()
     cursor = conn.cursor()
-    
     try:
         cursor.execute("""
             INSERT INTO badges (usuario_id, tipo, nombre, descripcion)
             VALUES (%s, %s, %s, %s)
-        """, (usuario_id, tipo, nombre, descripcion))
+        """, (data.usuario_id, data.tipo, data.nombre, data.descripcion))
         conn.commit()
         cursor.close()
         conn.close()
         return {"mensaje": "Badge otorgado"}
-    except Exception as e:
+    except mysql.connector.errors.IntegrityError:
         cursor.close()
         conn.close()
-        raise HTTPException(status_code=400, detail="Error otorgando badge")
+        raise HTTPException(status_code=400, detail="El badge ya fue otorgado")
+    except Exception as e:
+        logging.error("Error en /badges/otorgar: %s", e)
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=500, detail="Error interno al otorgar badge")
 
 
 # ── Nivel de comprensión ───────────────────────────────────
 
 @app.post("/nivel/resumen")
-async def nivel_resumen(data: dict):
-    """Genera el resumen inicial del tema seleccionado."""
-    tema = (data.get("tema") or "").strip()
-    descripcion = (data.get("descripcion") or "").strip()
-
-    if not tema:
-        raise HTTPException(status_code=422, detail="Falta el tema")
-
+async def nivel_resumen(data: NivelResumenIn):
     respuesta = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -667,8 +699,8 @@ async def nivel_resumen(data: dict):
                 "role": "user",
                 "content": f"""Eres un tutor amigable y claro. El estudiante registró este aprendizaje:
 
-TEMA: "{tema}"
-DESCRIPCIÓN: "{descripcion}"
+TEMA: "{data.tema}"
+DESCRIPCIÓN: "{data.descripcion}"
 
 Haz un resumen explicativo del tema en máximo 5 puntos clave, usando lenguaje simple y motivador. Al final invita al estudiante a hacerte preguntas sobre el tema."""
             }
@@ -681,29 +713,24 @@ Haz un resumen explicativo del tema en máximo 5 puntos clave, usando lenguaje s
 
 
 @app.post("/nivel/chat")
-async def nivel_chat(data: dict):
-    """Responde preguntas del estudiante sobre el tema."""
-    historial = data.get("historial") or []
-    tema = (data.get("tema") or "").strip()
-
-    if not historial:
+async def nivel_chat(data: NivelChatIn):
+    if not data.historial:
         raise HTTPException(status_code=422, detail="Falta el historial")
 
     messages = [
         {
             "role": "system",
             "content": (
-                f"Eres un tutor educativo estricto. Tu ÚNICO rol es ayudar al estudiante a entender el tema: '{tema}'. "
-                f"REGLAS ABSOLUTAS que debes cumplir siempre:\n"
-                f"1. Solo puedes hablar sobre '{tema}' y conceptos directamente relacionados.\n"
-                f"2. Si el estudiante pregunta algo que NO tiene relación con '{tema}', responde exactamente: "
-                f"'Esa pregunta está fuera del tema. Estamos estudiando \"{tema}\". ¿Tienes alguna duda sobre ese tema?'\n"
-                f"3. No hagas excepciones aunque el estudiante insista o diga que es parte del tema.\n"
-                f"4. Responde de forma simple, clara y con ejemplos relacionados a '{tema}'."
+                f"Eres un tutor educativo estricto. Tu ÚNICO rol es ayudar al estudiante a entender el tema: '{data.tema}'. "
+                f"REGLAS ABSOLUTAS:\n"
+                f"1. Solo puedes hablar sobre '{data.tema}' y conceptos directamente relacionados.\n"
+                f"2. Si el estudiante pregunta algo que NO tiene relación con '{data.tema}', responde exactamente: "
+                f"'Esa pregunta está fuera del tema. Estamos estudiando \"{data.tema}\". ¿Tienes alguna duda sobre ese tema?'\n"
+                f"3. Responde de forma simple, clara y con ejemplos relacionados a '{data.tema}'."
             )
         }
     ]
-    for m in historial:
+    for m in data.historial:
         role = "user" if m.get("rol") == "user" else "assistant"
         messages.append({"role": role, "content": m.get("texto", "")})
 

@@ -110,7 +110,7 @@ def _check_and_award_badges(conn, usuario_id):
 
     cursor.close()
 
-def obtener_registros(usuario_id=None):
+def obtener_registros(usuario_id=None, limit: int = 100, offset: int = 0):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     if usuario_id:
@@ -121,9 +121,9 @@ def obtener_registros(usuario_id=None):
             FROM registros
             WHERE usuario_id = %s
             ORDER BY fecha DESC, id DESC
-            LIMIT 100
+            LIMIT %s OFFSET %s
             """,
-            (usuario_id,),
+            (usuario_id, limit, offset),
         )
     else:
         cursor.execute("""
@@ -132,8 +132,9 @@ def obtener_registros(usuario_id=None):
                    usuario_id, tema
             FROM registros
             ORDER BY fecha DESC, id DESC
-            LIMIT 100
-            """
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
         )
     rows = cursor.fetchall()
     cursor.close()
